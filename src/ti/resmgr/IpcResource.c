@@ -38,6 +38,7 @@
 #include <ti/ipc/MultiProc.h>
 #include <ti/sysbios/BIOS.h>
 #include <ti/sysbios/knl/Task.h>
+#include <ti/srvmgr/NameMap.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -50,7 +51,6 @@
 #define DEFAULT_TIMEOUT 500
 #define MAXMSGSIZE 84
 
-static const UInt32 IpcResource_server = 100;
 
 static UInt16 IpcResource_resLen(IpcResource_Type type)
 {
@@ -88,11 +88,8 @@ static Int _IpcResource_translateError(Int kstatus)
 
 IpcResource_Handle IpcResource_connect(UInt timeout)
 {
-    UInt16 dstProc;
     UInt16 len;
-    UInt32 remote;
     IpcResource_Handle handle;
-    IpcResource_Req req;
     IpcResource_Ack ack;
     Int status;
 
@@ -106,36 +103,38 @@ IpcResource_Handle IpcResource_connect(UInt timeout)
                       (timeout == IpcResource_FOREVER) ? MessageQCopy_FOREVER :
                       timeout;
 
-    dstProc = MultiProc_getId("HOST");
-
     handle->msgq= MessageQCopy_create(MessageQCopy_ASSIGN_ANY,
                                       &handle->endPoint);
-    req.resType = 0;
-    req.reqType = IpcResource_REQ_TYPE_CONN;
-    req.resHandle = 0;
-    status = MessageQCopy_send(dstProc, IpcResource_server,
-                      handle->endPoint, &req, sizeof(req));
-    if (status) {
-        System_printf("IpcResource_connect: MessageQCopy_send "
-                      " failed status %d\n", status);
+    if (!handle->msgq) {
+        System_printf("IpcResource_connect: MessageQCopy_create failed\n");
         goto err;
     }
 
-    status = MessageQCopy_recv(handle->msgq, &ack, &len, &remote,
+    NameMap_register("rpmsg-resmgr", handle->endPoint);
+
+    status = MessageQCopy_recv(handle->msgq, &ack, &len, &handle->remote,
                                handle->timeout);
+    if (len < sizeof(ack)) {
+        System_printf("IpcResource_connect: Bad ack message len = %d\n", len);
+        goto err_disc;
+    }
+
     if (status) {
         System_printf("IpcResource_connect: MessageQCopy_recv "
                       "failed status %d\n", status);
-        goto err;
+        goto err_disc;
     }
+
     status = _IpcResource_translateError(ack.status);
     if (status) {
         System_printf("IpcResource_connect: A9 Resource Manager "
                       "failed status %d\n", status);
-        goto err;
+        goto err_disc;
     }
 
     return handle;
+err_disc:
+    MessageQCopy_delete(&handle->msgq);
 err:
     Memory_free(NULL, handle, sizeof(*handle));
     return NULL;
@@ -144,22 +143,12 @@ err:
 Int IpcResource_disconnect(IpcResource_Handle handle)
 {
     Int status;
-    IpcResource_Req req;
 
     if (!handle) {
         System_printf("IpcResource_disconnect: handle is NULL\n");
     }
 
-    req.resType = 0;
-    req.reqType = IpcResource_REQ_TYPE_DISCONN;
-
-    status = MessageQCopy_send(MultiProc_getId("HOST"), IpcResource_server,
-                        handle->endPoint, &req, sizeof(req));
-    if (status) {
-        System_printf("IpcResource_disconnect: MessageQCopy_send "
-                      "failed status %d\n", status);
-        return status;
-    }
+    NameMap_unregister("rpmsg-resmgr", handle->endPoint);
 
     status = MessageQCopy_delete(&handle->msgq);
     if (status) {
@@ -202,7 +191,7 @@ Int IpcResource_request(IpcResource_Handle handle,
     req->reqType = IpcResource_REQ_TYPE_ALLOC;
 
     memcpy(req->resParams, resParams, rlen);
-    status = MessageQCopy_send(MultiProc_getId("HOST"), IpcResource_server,
+    status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
                         handle->endPoint, req, hlen + rlen);
     if (status) {
         System_printf("IpcResource_request: MessageQCopy_send "
@@ -213,6 +202,14 @@ Int IpcResource_request(IpcResource_Handle handle,
 
     status = MessageQCopy_recv(handle->msgq, ack, &len, &remote,
                                handle->timeout);
+    if (remote != handle->remote) {
+        System_printf("IpcResource_request: MessageQCopy_recv "
+                      "invalid message source %d, channel source %d\n",
+                      remote, handle->remote);
+        status = IpcResource_E_FAIL;
+        goto end;
+    }
+
     if (status) {
         System_printf("IpcResource_request: MessageQCopy_recv "
                       "failed status %d\n", status);
@@ -220,6 +217,7 @@ Int IpcResource_request(IpcResource_Handle handle,
                  IpcResource_E_FAIL;
         goto end;
     }
+
     status = _IpcResource_translateError(ack->status);
     if (status) {
         System_printf("IpcResource_request: error from Host "
@@ -264,7 +262,7 @@ Int IpcResource_setConstraints(IpcResource_Handle handle,
     req->resHandle = resHandle;
 
     memcpy(req->resParams, constraints, rlen);
-    status = MessageQCopy_send(MultiProc_getId("HOST"), IpcResource_server,
+    status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
                         handle->endPoint, req, sizeof(*req) + rlen);
     if (status) {
         System_printf("IpcResource_setConstraints: MessageQCopy_send "
@@ -283,6 +281,14 @@ Int IpcResource_setConstraints(IpcResource_Handle handle,
                       "failed status %d\n", status);
         status = (status == MessageQCopy_E_TIMEOUT) ? IpcResource_E_TIMEOUT :
                  IpcResource_E_FAIL;
+        goto end;
+    }
+
+    if (remote != handle->remote) {
+        System_printf("IpcResource_setConstraints: MessageQCopy_recv "
+                      "invalid message source %d, channel source %d\n",
+                      remote, handle->remote);
+        status = IpcResource_E_FAIL;
         goto end;
     }
 
@@ -329,7 +335,7 @@ Int IpcResource_release(IpcResource_Handle handle,
     req.reqType = IpcResource_REQ_TYPE_FREE;
     req.resHandle = resHandle;
 
-    status = MessageQCopy_send(MultiProc_getId("HOST"), IpcResource_server,
+    status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
                       handle->endPoint, &req, sizeof(req));
     if (status) {
         System_printf("IpcResource_release: MessageQCopy_send "
