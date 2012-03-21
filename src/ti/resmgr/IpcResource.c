@@ -49,8 +49,9 @@
 #include "_IpcResource.h"
 
 #define DEFAULT_TIMEOUT 500
-#define MAXMSGSIZE 84
+#define MAXMSGSIZE 128
 
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 
 static UInt16 IpcResource_resLen(IpcResource_Type type)
 {
@@ -67,6 +68,30 @@ static UInt16 IpcResource_resLen(IpcResource_Type type)
         return sizeof(IpcResource_Sdma);
     }
     return 0;
+}
+
+static Char *IpcResource_names[] = {
+    "omap-gptimer",
+    "iva",
+    "iva_seq0",
+    "iva_seq1",
+    "l3bus",
+    "omap-iss",
+    "omap-fdif",
+    "omap-sl2if",
+    "omap-auxclk",
+    "regulator",
+    "gpio",
+    "omap-sdma",
+    "ipu",
+    "dsp"
+};
+
+static Char *IpcResource_toName(IpcResource_Type type)
+{
+    if (type < ARRAY_SIZE(IpcResource_names))
+        return IpcResource_names[type];
+    return NULL;
 }
 
 static Int _IpcResource_translateError(Int kstatus)
@@ -167,17 +192,27 @@ Int IpcResource_request(IpcResource_Handle handle,
                         IpcResource_Type type, Void *resParams)
 {
     Char msg[MAXMSGSIZE];
-    IpcResource_Req *req = (Void *)msg;
+    IpcResource_Act *act = (Void *)msg;
+    IpcResource_Req *req = (Void *)act->data;
     IpcResource_Ack *ack = (Void *)msg;
-    UInt16 hlen = sizeof(*req);
+    IpcResource_ReqAck *rack = (Void *)ack->data;
+    UInt16 hlen = sizeof(*req) + sizeof(*act);
     UInt16 alen = sizeof(*ack);
     UInt16 rlen = IpcResource_resLen(type);
     UInt16 len;
     UInt32 remote;
     Int status;
+    Char *name;
 
     if (!handle || !resHandle) {
         System_printf("IpcResource_request: Invalid paramaters\n");
+        return IpcResource_E_INVALARGS;
+    }
+
+    name = IpcResource_toName(type);
+    if (!name) {
+        System_printf("IpcResource_request: resource type %d "
+                      "no valid\n", type);
         return IpcResource_E_INVALARGS;
     }
 
@@ -187,12 +222,12 @@ Int IpcResource_request(IpcResource_Handle handle,
         return IpcResource_E_INVALARGS;
     }
 
-    req->resType = type;
-    req->reqType = IpcResource_REQ_TYPE_ALLOC;
+    strncpy(req->resName, name, 16);
+    act->action = IpcResource_REQ_TYPE_ALLOC;
 
     memcpy(req->resParams, resParams, rlen);
     status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
-                        handle->endPoint, req, hlen + rlen);
+                        handle->endPoint, act, hlen + rlen);
     if (status) {
         System_printf("IpcResource_request: MessageQCopy_send "
                       "failed status %d\n", status);
@@ -225,10 +260,10 @@ Int IpcResource_request(IpcResource_Handle handle,
         goto end;
     }
 
-    Assert_isTrue(len == (rlen + alen), NULL);
+    Assert_isTrue(len == rlen + alen + sizeof(*rack), NULL);
 
-    *resHandle = ack->resHandle;
-    memcpy(resParams, ack->resParams, rlen);
+    *resHandle = rack->resHandle;
+    memcpy(resParams, rack->resParams, rlen);
 end:
     return status;
 }
@@ -240,8 +275,9 @@ Int IpcResource_setConstraints(IpcResource_Handle handle,
 {
     Char msg[MAXMSGSIZE];
     IpcResource_Ack *ack = (Void *)msg;
-    IpcResource_Req *req = (Void *)msg;
-    UInt16 rlen = sizeof(IpcResource_ConstraintData);
+    IpcResource_Act *act = (Void *)msg;
+    IpcResource_Constraint *c = (Void *)act->data;
+    UInt16 rlen = sizeof(*c);
     UInt16 alen = sizeof(*ack);
     UInt16 len;
     UInt32 remote;
@@ -252,18 +288,17 @@ Int IpcResource_setConstraints(IpcResource_Handle handle,
         return IpcResource_E_INVALARGS;
     }
 
-    if (rlen && !constraints) {
+    if (!constraints) {
         System_printf("IpcResource_setConstraints: needs parameters\n");
         return IpcResource_E_INVALARGS;
     }
 
-    req->resType = 0;
-    req->reqType = action;
-    req->resHandle = resHandle;
+    act->action = action;
+    c->resHandle = resHandle;
 
-    memcpy(req->resParams, constraints, rlen);
+    memcpy(&c->cdata, constraints, rlen);
     status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
-                        handle->endPoint, req, sizeof(*req) + rlen);
+                        handle->endPoint, act, sizeof(*act) + rlen);
     if (status) {
         System_printf("IpcResource_setConstraints: MessageQCopy_send "
                       "failed status %d\n", status);
@@ -292,12 +327,18 @@ Int IpcResource_setConstraints(IpcResource_Handle handle,
         goto end;
     }
 
-    Assert_isTrue(len == (rlen + alen), NULL);
-
     status = _IpcResource_translateError(ack->status);
+    if (status) {
+        System_printf("IpcResource_setConstraints: error from Host "
+                      "failed status %d\n", status);
+        goto end;
+    }
+
+    Assert_isTrue(len == (rlen + alen), NULL);
 
 end:
     return status;
+
 }
 
 Int IpcResource_requestConstraints(IpcResource_Handle handle,
@@ -324,19 +365,20 @@ Int IpcResource_release(IpcResource_Handle handle,
                         IpcResource_ResHandle resHandle)
 {
     Int status;
-    IpcResource_Req req;
+    Char msg[sizeof(IpcResource_Act) + sizeof(IpcResource_Rel)];
+    IpcResource_Act *act = (Void *)msg;
+    IpcResource_Rel *rel = (Void *)act->data;
 
     if (!handle) {
         System_printf("IpcResource_release: handle is NULL\n");
         return IpcResource_E_INVALARGS;
     }
 
-    req.resType = 0;
-    req.reqType = IpcResource_REQ_TYPE_FREE;
-    req.resHandle = resHandle;
+    act->action = IpcResource_REQ_TYPE_FREE;
+    rel->resHandle = resHandle;
 
     status = MessageQCopy_send(MultiProc_getId("HOST"), handle->remote,
-                      handle->endPoint, &req, sizeof(req));
+                      handle->endPoint, act, sizeof(msg));
     if (status) {
         System_printf("IpcResource_release: MessageQCopy_send "
                       "failed status %d\n", status);
