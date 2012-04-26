@@ -74,7 +74,7 @@
 
 /* Legacy function to allow Linux side rpmsg sample tests to work: */
 extern void start_ping_tasks();
-extern void start_resmgr_task();
+extern void rpmsgTest_startTasks();
 
 /*
  *  ======== fxnDouble used by omx_benchmark test app ========
@@ -268,6 +268,8 @@ Int main(Int argc, char* argv[])
 
     /* Some background ping testing tasks, used by rpmsg samples: */
     start_ping_tasks();
+
+    rpmsgTest_startTasks();
 
 #if 0  /* CORE0 */
     /* Run a background task to test rpmsg_resmgr service */
